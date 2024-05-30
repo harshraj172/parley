@@ -2,7 +2,7 @@ import os
 import typing as t
 
 import openai
-from _types import Message, Parameters, Role
+from ._types import Message, Parameters, Role
 from mistralai.client import MistralClient # type: ignore
 from mistralai.models.chat_completion import ChatMessage # type: ignore
 from openai import OpenAI
