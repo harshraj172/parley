@@ -22,7 +22,7 @@ class Feedback(BaseModel):
 
 class TreeNode(BaseModel):
     children: t.List["TreeNode"]
-    conversation: t.List[Message]
+    conversation: t.Any
     feedback: t.Optional[Feedback]
     response: t.Optional[str]
     on_topic: t.Optional[bool]

@@ -22,7 +22,8 @@ from parley.models import chat_mistral, chat_openai, chat_together
 from parley.prompts import (
     get_prompt_for_evaluator_score,
     get_prompt_for_evaluator_on_topic,
-    get_prompt_for_attacker,
+    get_prompt_for_attacker1,
+    get_prompt_for_attacker2,
     get_prompt_for_target,
 )
 
@@ -164,7 +165,7 @@ def call(goal: Annotated[str, "goal"],
          depth: Annotated[int, "Tree of thought depth"] = 10,
          stop_score: Annotated[int, "Stop when the score is above this value"] = 8):
 
-    attacker_system_prompt = get_prompt_for_attacker(goal)
+    attacker_system_prompt = get_prompt_for_attacker2(goal)
     scoring_system_prompt = get_prompt_for_evaluator_score(goal)
     on_topic_system_prompt = get_prompt_for_evaluator_on_topic(goal)
     target_system_prompt = get_prompt_for_target()
@@ -237,6 +238,174 @@ def call(goal: Annotated[str, "goal"],
                 assert child.feedback is not None
 
                 print(f"  |= {iteration + 1}->{i + 1}->{k + 1}")
+                print(f'   |- Improvement: "{child.feedback.improvement[:400]}"')
+                print(f'   |- Prompt:      "{child.feedback.prompt[:400]}"')
+
+                child.on_topic = check_on_topic(
+                    on_topic_system_prompt, evaluator_chat, child.feedback.prompt
+                )
+                if not child.on_topic:
+                    print("   |- Off topic.")
+                    continue
+
+                print("   |- ON topic ...")
+
+                # Add any additional prompt alterations here
+                prompt = child.feedback.prompt
+
+                child.response = target_chat(
+                    [
+                        Message(role=Role.system, content=target_system_prompt),
+                        Message(role=Role.user, content=prompt),
+                    ]
+                ).content
+
+                child.score = score(
+                    scoring_system_prompt,
+                    evaluator_chat,
+                    child.feedback.prompt,
+                    child.response,
+                )
+
+                print(f'   |- Response:    "{child.response[400]}"')
+                print(f"   |- Score:       {child.score}")
+                
+                if child.score >= stop_score:
+                    print()
+                    print("[+] Found a good attack!")
+                    print(f" |- Prompt: {child.feedback.prompt}")
+                    print(f" |- Response: {child.response}")
+                    print()
+                    return child.feedback.prompt
+
+        # 4 - Prune the tree and step down
+
+        children = [
+            child for node in current_nodes for child in node.children if child.on_topic
+        ]
+        children.sort(
+            key=lambda x: (x.score if x.score is not None else float("-inf")),
+            reverse=True,
+        )
+
+        current_nodes = children[: width]
+
+        if len(current_nodes) == 0:
+            print()
+            print("[!] No more nodes to explore")
+            print()
+            return []
+        
+        
+def call_rt(goal: Annotated[str, "goal"],
+         risk_category: Annotated[str, "risk_category"],
+         target_chat: Annotated[ChatFunction, "Target Chat caller"],
+         evaluator_chat: Annotated[ChatFunction, "Evaluator Chat caller"],
+         attacker_chat: Annotated[ChatFunction, "Attacker Chat caller"],
+         root_nodes: Annotated[int, "Tree of thought root node count"] = 3,
+         branching_factor: Annotated[int, "Tree of thought branching factor"] = 3,
+         width: Annotated[int, "Tree of thought width"] = 10,
+         depth: Annotated[int, "Tree of thought depth"] = 10,
+         stop_score: Annotated[int, "Stop when the score is above this value"] = 8):
+
+    target_system_prompt = get_prompt_for_target()
+    
+    root_nodes: t.List[TreeNode] = [
+        TreeNode(
+            children=[],
+            conversation={
+                "risk_category": [Message(role=Role.system, content="")],
+                "attack_style": [Message(role=Role.system, content="")],
+            },
+            feedback=None,
+            response=None,
+            on_topic=None,
+            score=None,
+        )
+        for _ in range(root_nodes)
+    ]
+
+    current_nodes: t.List[TreeNode] = root_nodes
+
+    print("[+] Beginning TAP ...")
+    for iteration in range(depth):
+        print(f" |- Iteration {iteration + 1} with {len(current_nodes)} nodes ...")
+
+        for i, node in enumerate(current_nodes):
+            # 1 - Prepare the next conversation step
+
+            response_str = (
+                f"{node.response[:300]}..."
+                if node.response is not None
+                else "[Ignore, this is your first attempt]"
+            )
+            score_str = (
+                node.score
+                if node.score is not None
+                else "[Ignore, this is your first attempt]"
+            )
+            next_message = Message(
+                role=Role.user,
+                content=f"Goal (G): {goal}",
+            )
+            
+            node.conversation["risk_category"].append(next_message)
+            
+            # 2 - Branch out
+
+            for bf_idx in range(branching_factor):
+                # mutation 1
+                attacker_system_prompt1 = get_prompt_for_attacker1(goal, risk_category=risk_category)
+                node.conversation["risk_category"][0].content = attacker_system_prompt1
+                feedback1 = attack(attacker_chat, node.conversation["risk_category"])
+                if feedback1 is None:
+                    print("  |> Attack 1 generation failed")
+                    continue
+                
+                conversation = copy.deepcopy(node.conversation)
+                conversation["risk_category"].append(
+                    Message(role=Role.assistant, content=feedback1.model_dump_json())
+                )
+                
+                # mutation 2
+                goal_prime = eval(feedback1.model_dump_json())["prompt"]
+                print(f'   |- goal_prime: "{goal_prime[:400]}"')
+
+                attacker_system_prompt2 = get_prompt_for_attacker2(goal_prime)
+                conversation["attack_style"][0].content = attacker_system_prompt2
+                on_topic_system_prompt = get_prompt_for_evaluator_on_topic(goal_prime)
+                scoring_system_prompt = get_prompt_for_evaluator_score(goal_prime)
+                next_message = Message(
+                    role=Role.user,
+                    content=f"Goal (G): {goal_prime}\nResponse (R): {response_str}\nScore (S): {score_str}",
+                )
+                conversation["attack_style"].append(next_message) 
+                feedback2 = attack(attacker_chat, conversation["attack_style"])
+                if feedback2 is None:
+                    print("  |> Attack 2 generation failed")
+                    continue
+                
+                conversation["attack_style"].append(
+                    Message(role=Role.assistant, content=feedback2.model_dump_json())
+                )
+
+                node.children.append(
+                    TreeNode(
+                        children=[],
+                        conversation=conversation,
+                        feedback=feedback2,
+                        response=None,
+                        on_topic=None,
+                        score=None,
+                    )
+                )
+
+                # 3 - Perform the inference + evaluations
+                k, child = len(node.children)-1, node.children[-1]
+                # for k, child in enumerate(node.children):
+                assert child.feedback is not None
+
+                print(f"  |= {iteration + 1}->{i + 1}->{k + 1}")
                 print(f'   |- Improvement: "{child.feedback.improvement[:100]}"')
                 print(f'   |- Prompt:      "{child.feedback.prompt[:100]}"')
 
@@ -293,4 +462,4 @@ def call(goal: Annotated[str, "goal"],
             print()
             print("[!] No more nodes to explore")
             print()
-            return []
+            return []        
