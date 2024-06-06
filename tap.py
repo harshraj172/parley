@@ -267,7 +267,7 @@ def call(goal: Annotated[str, "goal"],
                     child.response,
                 )
 
-                print(f'   |- Response:    "{child.response[400]}"')
+                print(f'   |- Response:    "{child.response[:400]}"')
                 print(f"   |- Score:       {child.score}")
                 
                 if child.score >= stop_score:
@@ -298,7 +298,7 @@ def call(goal: Annotated[str, "goal"],
         
         
 def call_rt(goal: Annotated[str, "goal"],
-         risk_category: Annotated[str, "risk_category"],
+         risk_categories: Annotated[t.List[str], "list of risk_categories"],
          target_chat: Annotated[ChatFunction, "Target Chat caller"],
          evaluator_chat: Annotated[ChatFunction, "Evaluator Chat caller"],
          attacker_chat: Annotated[ChatFunction, "Attacker Chat caller"],
@@ -308,158 +308,163 @@ def call_rt(goal: Annotated[str, "goal"],
          depth: Annotated[int, "Tree of thought depth"] = 10,
          stop_score: Annotated[int, "Stop when the score is above this value"] = 8):
 
-    target_system_prompt = get_prompt_for_target()
+    for rc_idx, risk_category in enumerate(risk_categories):
+        attacker_system_prompt1 = get_prompt_for_attacker1(goal, risk_category=risk_category)
+        target_system_prompt = get_prompt_for_target()
     
-    root_nodes: t.List[TreeNode] = [
-        TreeNode(
-            children=[],
-            conversation={
-                "risk_category": [Message(role=Role.system, content="")],
-                "attack_style": [Message(role=Role.system, content="")],
-            },
-            feedback=None,
-            response=None,
-            on_topic=None,
-            score=None,
-        )
-        for _ in range(root_nodes)
-    ]
-
-    current_nodes: t.List[TreeNode] = root_nodes
-
-    print("[+] Beginning TAP ...")
-    for iteration in range(depth):
-        print(f" |- Iteration {iteration + 1} with {len(current_nodes)} nodes ...")
-
-        for i, node in enumerate(current_nodes):
-            # 1 - Prepare the next conversation step
-
-            response_str = (
-                f"{node.response[:300]}..."
-                if node.response is not None
-                else "[Ignore, this is your first attempt]"
+        _root_nodes: t.List[TreeNode] = [
+            TreeNode(
+                children=[],
+                conversation={
+                    "risk_category": [Message(role=Role.system, content=attacker_system_prompt1)],
+                    "attack_style": [Message(role=Role.system, content="")],
+                },
+                feedback=None,
+                response=None,
+                on_topic=None,
+                score=None,
             )
-            score_str = (
-                node.score
-                if node.score is not None
-                else "[Ignore, this is your first attempt]"
-            )
+            for _ in range(root_nodes)
+        ]
+
+        current_nodes: t.List[TreeNode] = _root_nodes
+
+        for node in current_nodes:
+            # mutation 1
             next_message = Message(
                 role=Role.user,
-                content=f"Goal (G): {goal}",
+                content=f"Goal (G): {goal}\nRisk Category (RC): {risk_category}",
             )
-            
             node.conversation["risk_category"].append(next_message)
+                    
+            feedback1 = attack(attacker_chat, node.conversation["risk_category"])
+            if feedback1 is None:
+                print("  |> Attack 1 generation failed")
+                continue
             
-            # 2 - Branch out
+            node.conversation["risk_category"].append(
+                Message(role=Role.assistant, content=feedback1.model_dump_json())
+            )
+        
+        print("[+] Beginning TAP ...")
+        for iteration in range(depth):
+            print(f" |- Iteration {iteration + 1} with {len(current_nodes)} nodes ...")
 
-            for bf_idx in range(branching_factor):
-                # mutation 1
-                attacker_system_prompt1 = get_prompt_for_attacker1(goal, risk_category=risk_category)
-                node.conversation["risk_category"][0].content = attacker_system_prompt1
-                feedback1 = attack(attacker_chat, node.conversation["risk_category"])
-                if feedback1 is None:
-                    print("  |> Attack 1 generation failed")
-                    continue
+            for i, node in enumerate(current_nodes):
+                goal = eval(node.conversation["risk_category"][-1].content)["prompt"]
+                attacker_system_prompt2 = get_prompt_for_attacker2(goal)
+                on_topic_system_prompt = get_prompt_for_evaluator_on_topic(goal)
+                scoring_system_prompt = get_prompt_for_evaluator_score(goal)
                 
-                conversation = copy.deepcopy(node.conversation)
-                conversation["risk_category"].append(
-                    Message(role=Role.assistant, content=feedback1.model_dump_json())
+                # modify system prompt with new goal
+                node.conversation["attack_style"][0].content = attacker_system_prompt2
+                
+                # 1 - Prepare the next conversation step
+
+                response_str = (
+                    f"{node.response[:300]}..."
+                    if node.response is not None
+                    else "[Ignore, this is your first attempt]"
                 )
-                
-                # mutation 2
-                goal_prime = eval(feedback1.model_dump_json())["prompt"]
-                print(f'   |- goal_prime: "{goal_prime[:400]}"')
-
-                attacker_system_prompt2 = get_prompt_for_attacker2(goal_prime)
-                conversation["attack_style"][0].content = attacker_system_prompt2
-                on_topic_system_prompt = get_prompt_for_evaluator_on_topic(goal_prime)
-                scoring_system_prompt = get_prompt_for_evaluator_score(goal_prime)
+                score_str = (
+                    node.score
+                    if node.score is not None
+                    else "[Ignore, this is your first attempt]"
+                )
                 next_message = Message(
                     role=Role.user,
-                    content=f"Goal (G): {goal_prime}\nResponse (R): {response_str}\nScore (S): {score_str}",
-                )
-                conversation["attack_style"].append(next_message) 
-                feedback2 = attack(attacker_chat, conversation["attack_style"])
-                if feedback2 is None:
-                    print("  |> Attack 2 generation failed")
-                    continue
-                
-                conversation["attack_style"].append(
-                    Message(role=Role.assistant, content=feedback2.model_dump_json())
+                    content=f"Goal (G): {goal}\nResponse (R): {response_str}\nScore (S): {score_str}",
                 )
 
-                node.children.append(
-                    TreeNode(
-                        children=[],
-                        conversation=conversation,
-                        feedback=feedback2,
-                        response=None,
-                        on_topic=None,
-                        score=None,
+                node.conversation["attack_style"].append(next_message)
+
+                # 2 - Branch out
+
+                for _ in range(branching_factor):
+                    feedback2 = attack(attacker_chat, node.conversation["attack_style"])
+                    if feedback2 is None:
+                        print("  |> Attack generation failed")
+                        continue
+
+                    conversation = copy.deepcopy(node.conversation["attack_style"])
+                    conversation.append(
+                        Message(role=Role.assistant, content=feedback2.model_dump_json())
                     )
-                )
+
+                    node.children.append(
+                        TreeNode(
+                            children=[],
+                            conversation=conversation,
+                            feedback=feedback2,
+                            response=None,
+                            on_topic=None,
+                            score=None,
+                        )
+                    )
 
                 # 3 - Perform the inference + evaluations
-                k, child = len(node.children)-1, node.children[-1]
-                # for k, child in enumerate(node.children):
-                assert child.feedback is not None
 
-                print(f"  |= {iteration + 1}->{i + 1}->{k + 1}")
-                print(f'   |- Improvement: "{child.feedback.improvement[:100]}"')
-                print(f'   |- Prompt:      "{child.feedback.prompt[:100]}"')
+                for k, child in enumerate(node.children):
+                    assert child.feedback is not None
 
-                child.on_topic = check_on_topic(
-                    on_topic_system_prompt, evaluator_chat, child.feedback.prompt
-                )
-                if not child.on_topic:
-                    print("   |- Off topic.")
-                    continue
+                    print(f"  |= {iteration + 1}->{i + 1}->{k + 1}")
+                    print(f'   |- Improvement: "{child.feedback.improvement[:400]}"')
+                    print(f'   |- Prompt:      "{child.feedback.prompt[:400]}"')
 
-                print("   |- ON topic ...")
+                    child.on_topic = check_on_topic(
+                        on_topic_system_prompt, evaluator_chat, child.feedback.prompt
+                    )
+                    if not child.on_topic:
+                        print("   |- Off topic.")
+                        continue
 
-                # Add any additional prompt alterations here
-                prompt = child.feedback.prompt
+                    print("   |- ON topic ...")
 
-                child.response = target_chat(
-                    [
-                        Message(role=Role.system, content=target_system_prompt),
-                        Message(role=Role.user, content=prompt),
-                    ]
-                ).content
+                    # Add any additional prompt alterations here
+                    prompt = child.feedback.prompt
 
-                child.score = score(
-                    scoring_system_prompt,
-                    evaluator_chat,
-                    child.feedback.prompt,
-                    child.response,
-                )
+                    child.response = target_chat(
+                        [
+                            Message(role=Role.system, content=target_system_prompt),
+                            Message(role=Role.user, content=prompt),
+                        ]
+                    ).content
 
-                print(f'   |- Response:    "{child.response[:100]}"')
-                print(f"   |- Score:       {child.score}")
-                
-                if child.score >= stop_score:
-                    print()
-                    print("[+] Found a good attack!")
-                    print(f" |- Prompt: {child.feedback.prompt}")
-                    print(f" |- Response: {child.response}")
-                    print()
-                    return child.feedback.prompt
+                    child.score = score(
+                        scoring_system_prompt,
+                        evaluator_chat,
+                        child.feedback.prompt,
+                        child.response,
+                    )
 
-        # 4 - Prune the tree and step down
+                    print(f'   |- Response:    "{child.response[:400]}"')
+                    print(f"   |- Score:       {child.score}")
+                    
+                    if child.score >= stop_score:
+                        print()
+                        print("[+] Found a good attack!")
+                        print(f" |- Prompt: {child.feedback.prompt}")
+                        print(f" |- Response: {child.response}")
+                        print()
+                        return child.feedback.prompt
 
-        children = [
-            child for node in current_nodes for child in node.children if child.on_topic
-        ]
-        children.sort(
-            key=lambda x: (x.score if x.score is not None else float("-inf")),
-            reverse=True,
-        )
+            # 4 - Prune the tree and step down
 
-        current_nodes = children[: width]
+            children = [
+                child for node in current_nodes for child in node.children if child.on_topic
+            ]
+            children.sort(
+                key=lambda x: (x.score if x.score is not None else float("-inf")),
+                reverse=True,
+            )
 
-        if len(current_nodes) == 0:
-            print()
-            print("[!] No more nodes to explore")
-            print()
-            return []        
+            current_nodes = children[: width]
+
+            if len(current_nodes) == 0:
+                print()
+                print("[!] No more nodes to explore")
+                print()
+                if rc_idx + 1 == len(risk_categories):
+                    return []
+                else:
+                    break
